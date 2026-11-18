@@ -190,6 +190,9 @@ def gx2inv(p: Union[float, np.ndarray], w: np.ndarray, k: np.ndarray, lambda_: n
     """
     Returns the inverse cdf of a generalized chi-squared, using Ruben's [1962] method, Davies' [1973] method, or the native ncx2inv, depending on the input.
 
+    Raises RuntimeError when the root finder does not converge, instead of
+    returning a point that is not the requested quantile.
+
     Required inputs:
     p         probabilities at which to evaluate the inverse cdf
     w         row vector of weights of the non-central chi-squares
@@ -214,18 +217,26 @@ def gx2inv(p: Union[float, np.ndarray], w: np.ndarray, k: np.ndarray, lambda_: n
     if s == 0 and len(set(w)) == 1:
         # native ncx2 fallback
         if np.sign(np.unique(w)[0]) == 1:
-            if side.lower == "lower":
+            if side.lower() == "lower":
                 x = ncx2.ppf(p, sum(k), sum(lambda_)) * np.unique(w) + m
             else:
                 x = ncx2.isf(p, sum(k), sum(lambda_)) * np.unique(w) + m
         elif np.sign(np.unique(w)[0]) == -1:
-            if side.lower == "lower":
+            if side.lower() == "lower":
                 x = ncx2.ppf(1 - p, sum(k), sum(lambda_)) * np.unique(w) + m
             else:
                 x = ncx2.isf(1 - p, sum(k), sum(lambda_)) * np.unique(w) + m
     else:
         mu = gx2stat(w, k, lambda_, s, m)[0]
-        x = np.array([root(lambda x: gx2cdf(x, w, k, lambda_, m, s, AbsTol=AbsTol, RelTol=RelTol, side=side) - p_val, mu).x[0] for p_val in np.atleast_1d(p)])
+
+        def solve(p_val):
+            sol = root(lambda x: gx2cdf(x, w, k, lambda_, m, s, AbsTol=AbsTol, RelTol=RelTol, side=side) - p_val, mu)
+            if not sol.success:
+                # an unconverged root is not the quantile: never return it silently
+                raise RuntimeError(f"gx2inv: root finding did not converge for p={p_val}: {sol.message}")
+            return sol.x[0]
+
+        x = np.array([solve(p_val) for p_val in np.atleast_1d(p)])
 
     return x
 
@@ -340,7 +351,8 @@ def gx2cdf_davies(x: Union[float, np.ndarray], w: np.ndarray, k: np.ndarray, lam
 
     def davies_integrand(u, x, w, k, lambda_, s):
         # theta = np.sum(k * np.arctan(w * u) + (lambda_ * (w * u)) / (1 + w ** 2 * u ** 2), axis=1) / 2 - u * x / 2
-        theta = np.sum(k * np.arctan(w * u) + (lambda_ * (w * u)) / (1 + w ** 2 * u ** 2)) / 2 - u * x / 2
+        # x - m: the normal term shifts the distribution by m, so the inversion evaluates at (x - m)
+        theta = np.sum(k * np.arctan(w * u) + (lambda_ * (w * u)) / (1 + w ** 2 * u ** 2)) / 2 - u * (x - m) / 2
         # rho = np.prod(((1 + w ** 2 * u ** 2) ** (k / 4)) * np.exp(((w ** 2 * u ** 2) * lambda_) / (2 * (1 + w ** 2 * u ** 2))), axis=1) * np.exp(u ** 2 * s ** 2 / 8)
         rho = np.prod(((1 + w ** 2 * u ** 2) ** (k / 4)) * np.exp(((w ** 2 * u ** 2) * lambda_) / (2 * (1 + w ** 2 * u ** 2)))) * np.exp(u ** 2 * s ** 2 / 8)
         return np.sin(theta) / (u * rho)
@@ -440,7 +452,10 @@ def gx2cdf_ruben(x: Union[float, np.ndarray], w: np.ndarray, k: np.ndarray, lamb
     m         mean of normal term
 
     Optional positional input:
-    N         no. of terms in the approximation. Default = 1000.
+    N         cap on the no. of terms in the approximation. The series stops
+              early once its truncation bound is below 1e-14; if it has not
+              converged within N terms (small w_min/w_max), errbnd stays
+              large and the caller should use another method. Default = 1000.
 
     Outputs:
     p         computed cdf
@@ -465,17 +480,31 @@ def gx2cdf_ruben(x: Union[float, np.ndarray], w: np.ndarray, k: np.ndarray, lamb
     # compute the g's
     g = np.sum(k * (1 - beta / w) ** n[:, None] + beta * n[:, None] * ((1 - beta / w) ** (n[:, None] - 1)) * (lambda_ / w), axis=1)
 
-    # compute the expansion coefficients
+    # compute the expansion coefficients, stopping once the leftover series
+    # mass is negligible. The a_j are nonnegative and sum to 1, so the
+    # remaining mass 1 - sum(a) both bounds the truncation error and decreases
+    # monotonically: N is chosen from that bound instead of always summing the
+    # full series. If the cap N is reached first, the series has not converged
+    # (which is what a small w_min / w_max does) and the large errbnd returned
+    # below tells the caller not to trust this value and to use another method.
     a = np.empty(N)
     a[0] = np.sqrt(np.exp(-np.sum(lambda_)) * beta ** M * np.prod(w ** -k))
     if a[0] < np.finfo(float).tiny:
         raise ValueError('Underflow error: some series coefficients are smaller than machine precision.')
 
+    masstol = 1e-14
+    n_terms = N
+    cumsum = a[0]
     for j in range(1, N):
         a[j] = np.dot(np.flip(g[:j]), a[:j]) / (2 * j)
+        cumsum += a[j]
+        if 1 - cumsum < masstol:
+            n_terms = j + 1
+            break
+    a = a[:n_terms]
 
     # compute the central chi-squared integrals
-    xg, mg = np.meshgrid((x - m) / beta, M + 2 * np.arange(N))
+    xg, mg = np.meshgrid((x - m) / beta, M + 2 * np.arange(n_terms))
     F = chi2.cdf(xg, mg)
 
     # compute the integral
@@ -486,14 +515,14 @@ def gx2cdf_ruben(x: Union[float, np.ndarray], w: np.ndarray, k: np.ndarray, lamb
         p = 1 - p
 
     # compute the truncation error
-    errbnd = (1 - np.sum(a)) * chi2.cdf((x - m) / beta, M + 2 * N)
+    errbnd = (1 - np.sum(a)) * chi2.cdf((x - m) / beta, M + 2 * n_terms)
 
     return p, errbnd
 
 
 def gx2cdf(x: Union[float, np.ndarray], w: np.ndarray, k: np.ndarray, lambda_: np.ndarray, m: float, s: float, side: str = 'lower', AbsTol: float = 1e-10, RelTol: float = 1e-6) -> np.ndarray:
     """
-    Returns the cdf of a generalized chi-squared (a weighted sum of non-central chi-squares and a normal), using Ruben's [1962] method, Davies' [1973] method, or the native ncx2cdf, depending on the input.
+    Returns the cdf of a generalized chi-squared (a weighted sum of non-central chi-squares and a normal), using Ruben's [1962] method, Davies' [1973] method, or the native ncx2cdf, depending on the input. When Ruben's series has not converged to the requested tolerance, Davies' method is used instead.
 
     Required inputs:
     x         points at which to evaluate the CDF
@@ -522,8 +551,17 @@ def gx2cdf(x: Union[float, np.ndarray], w: np.ndarray, k: np.ndarray, lambda_: n
             p = ncx2.sf((x - m) / np.unique(w), sum(k), sum(lambda_))  # survival function (1 - cdf) for 'upper'
     elif s == 0 and (all(w > 0) or all(w < 0)):
         try:
-            p, _ = gx2cdf_ruben(x, w, k, lambda_, m, side=side, N=1000)
-        except:
+            p, errbnd = gx2cdf_ruben(x, w, k, lambda_, m, side=side, N=1000)
+            # Ruben's series converges like (1 - 0.906 w_min/w_max)^n, so when
+            # the weights span a few orders of magnitude it has not converged
+            # within N terms. Its truncation bound then exceeds the requested
+            # tolerance and the value must not be trusted: fall back to Davies'
+            # method instead of returning a wrong cdf.
+            bad = (~np.isfinite(p) | ~np.isfinite(errbnd)
+                   | (np.asarray(errbnd) > AbsTol + RelTol * np.abs(p)))
+            if np.any(bad):
+                raise ValueError("Ruben series truncation error exceeds tolerance.")
+        except Exception:
             p, _ = gx2cdf_davies(x, w, k, lambda_, m, s, side=side, AbsTol=AbsTol, RelTol=RelTol)
     else:
         p, _ = gx2cdf_davies(x, w, k, lambda_, m, s, side=side, AbsTol=AbsTol, RelTol=RelTol)
