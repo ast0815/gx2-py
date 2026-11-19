@@ -440,7 +440,7 @@ def gx2cdf_imhof(x: Union[float, np.ndarray], w: np.ndarray, k: np.ndarray, lamb
 
     return p, flag
 
-def gx2cdf_ruben(x: Union[float, np.ndarray], w: np.ndarray, k: np.ndarray, lambda_: np.ndarray, m: float, side: str = 'lower', N: int = 1000) -> Tuple[np.ndarray, float]:
+def gx2cdf_ruben(x: Union[float, np.ndarray], w: np.ndarray, k: np.ndarray, lambda_: np.ndarray, m: float, side: str = 'lower', N: int = 1000, AbsTol: float = 1e-10, RelTol: float = 1e-6) -> Tuple[np.ndarray, float]:
     """
     Returns the cdf of a generalized chi-squared (a weighted sum of non-central chi-squares with all weights the same sign), using Ruben's [1962] method.
 
@@ -453,9 +453,14 @@ def gx2cdf_ruben(x: Union[float, np.ndarray], w: np.ndarray, k: np.ndarray, lamb
 
     Optional positional input:
     N         cap on the no. of terms in the approximation. The series stops
-              early once its truncation bound is below 1e-14; if it has not
-              converged within N terms (small w_min/w_max), errbnd stays
-              large and the caller should use another method. Default = 1000.
+              early once its truncation bound is below 1e-14, or below
+              AbsTol + RelTol * |p| so that the value already meets the
+              requested tolerance; if it has not converged within N terms
+              (small w_min/w_max), errbnd stays large and the caller should
+              use another method. Default = 1000.
+    AbsTol    absolute tolerance used for that early stop; pass the caller's
+              own value so the stop matches its acceptance test.
+    RelTol    relative tolerance used for the same early stop.
 
     Outputs:
     p         computed cdf
@@ -495,12 +500,42 @@ def gx2cdf_ruben(x: Union[float, np.ndarray], w: np.ndarray, k: np.ndarray, lamb
     masstol = 1e-14
     n_terms = N
     cumsum = a[0]
+    gflip = g[::-1]  # flip(g[:j]) == gflip[-j:]: no per-term copy of g
+    check_every = 64
+    p_part = None  # partial cdf (lower side) up to the last check point
+    f_done = -1  # series terms already folded into p_part
     for j in range(1, N):
-        a[j] = np.dot(np.flip(g[:j]), a[:j]) / (2 * j)
+        a[j] = np.dot(gflip[-j:], a[:j]) / (2 * j)
         cumsum += a[j]
         if 1 - cumsum < masstol:
             n_terms = j + 1
             break
+        if j % check_every == 0:
+            # np.sum pairs its inputs, so unlike the sequential cumsum it
+            # cannot round to a stop above masstol while the series has
+            # actually converged (1 - cumsum then freezes, e.g. at 1.1e-14
+            # for a 80:1 span, and the test above would never fire).
+            leftover = 1 - np.sum(a[:j + 1])
+            if leftover < masstol:
+                n_terms = j + 1
+                break
+            # Stop as soon as the truncation bound fits the requested
+            # tolerance: that is the same test the caller applies to errbnd,
+            # so a value whose uncertainties are already valid need not run
+            # on to masstol.
+            dfs = M + 2 * np.arange(f_done + 1, j + 1)
+            xg, mg = np.meshgrid((x - m) / beta, dfs)
+            p_part = np.dot(a[f_done + 1:j + 1], chi2.cdf(xg, mg)) if p_part is None \
+                else p_part + np.dot(a[f_done + 1:j + 1], chi2.cdf(xg, mg))
+            f_done = j
+            if (lambda_pos and side.lower() == 'upper') or (not lambda_pos and side.lower() == 'lower'):
+                p_side = 1 - p_part
+            else:
+                p_side = p_part
+            Fj = chi2.cdf((x - m) / beta, M + 2 * (j + 1))
+            if np.all(leftover * Fj <= AbsTol + RelTol * np.abs(p_side)):
+                n_terms = j + 1
+                break
     a = a[:n_terms]
 
     # compute the central chi-squared integrals
@@ -520,9 +555,36 @@ def gx2cdf_ruben(x: Union[float, np.ndarray], w: np.ndarray, k: np.ndarray, lamb
     return p, errbnd
 
 
+# Cap on the terms of Ruben's series used by gx2cdf. A full run of this size
+# costs about half of one Davies evaluation, so Ruben gets at most half the
+# time of the method it would fall back to.
+RUBEN_N = 5000
+
+
+def _ruben_expected_terms(w: np.ndarray) -> float:
+    """
+    Expected number of terms gx2cdf_ruben needs before its truncation bound
+    drops below its masstol of 1e-14.
+
+    The leftover series mass decays geometrically with ratio
+    rho = 1 - 0.90625 * w_min / w_max, so n* = ln(1e14) / -ln(rho).
+    Measured against the coefficient recurrence: for lambda = 0 the exit lands
+    within about 10-20% of n* up to 200:1, while non-centrality and the
+    longest spans need up to ~2x more terms because the mass first builds up
+    from a small a[0]. The guess only has to place n* relative to RUBEN_N:
+    whenever it lands on the wrong side, gx2cdf still accepts or rejects the
+    value on its errbnd, so a misestimate costs time, never accuracy.
+    """
+    w = np.abs(np.atleast_1d(np.asarray(w, dtype=float)))
+    rho = 1.0 - 0.90625 * np.min(w) / np.max(w)
+    if rho >= 1.0:  # a zero weight: the series cannot converge at all
+        return np.inf
+    return np.log(1e14) / -np.log(rho)
+
+
 def gx2cdf(x: Union[float, np.ndarray], w: np.ndarray, k: np.ndarray, lambda_: np.ndarray, m: float, s: float, side: str = 'lower', AbsTol: float = 1e-10, RelTol: float = 1e-6) -> np.ndarray:
     """
-    Returns the cdf of a generalized chi-squared (a weighted sum of non-central chi-squares and a normal), using Ruben's [1962] method, Davies' [1973] method, or the native ncx2cdf, depending on the input. When Ruben's series has not converged to the requested tolerance, Davies' method is used instead.
+    Returns the cdf of a generalized chi-squared (a weighted sum of non-central chi-squares and a normal), using Ruben's [1962] method, Davies' [1973] method, or the native ncx2cdf, depending on the input. When Ruben's series is not expected to converge within its term cap, Davies' method is chosen directly; when it has run but has not converged to the requested tolerance, Davies' method is used instead unless the truncation bound still fits the tolerance.
 
     Required inputs:
     x         points at which to evaluate the CDF
@@ -550,19 +612,27 @@ def gx2cdf(x: Union[float, np.ndarray], w: np.ndarray, k: np.ndarray, lambda_: n
         else:
             p = ncx2.sf((x - m) / np.unique(w), sum(k), sum(lambda_))  # survival function (1 - cdf) for 'upper'
     elif s == 0 and (all(w > 0) or all(w < 0)):
-        try:
-            p, errbnd = gx2cdf_ruben(x, w, k, lambda_, m, side=side, N=1000)
-            # Ruben's series converges like (1 - 0.906 w_min/w_max)^n, so when
-            # the weights span a few orders of magnitude it has not converged
-            # within N terms. Its truncation bound then exceeds the requested
-            # tolerance and the value must not be trusted: fall back to Davies'
-            # method instead of returning a wrong cdf.
-            bad = (~np.isfinite(p) | ~np.isfinite(errbnd)
-                   | (np.asarray(errbnd) > AbsTol + RelTol * np.abs(p)))
-            if np.any(bad):
-                raise ValueError("Ruben series truncation error exceeds tolerance.")
-        except Exception:
+        if _ruben_expected_terms(w) > RUBEN_N:
+            # The series is expected to need more than RUBEN_N terms, so it
+            # cannot converge before the cap and would only burn its term
+            # budget before falling back anyway: take Davies' method directly.
             p, _ = gx2cdf_davies(x, w, k, lambda_, m, s, side=side, AbsTol=AbsTol, RelTol=RelTol)
+        else:
+            try:
+                p, errbnd = gx2cdf_ruben(x, w, k, lambda_, m, side=side, N=RUBEN_N, AbsTol=AbsTol, RelTol=RelTol)
+                # Ruben's series converges like (1 - 0.906 w_min/w_max)^n, so when
+                # the weights span a few orders of magnitude it has not converged
+                # within N terms. Its truncation bound then exceeds the requested
+                # tolerance and the value must not be trusted: fall back to Davies'
+                # method instead of returning a wrong cdf. A value whose bound
+                # still fits the tolerance is kept even when the series hit the
+                # cap without converging (the expected term count can be off).
+                bad = (~np.isfinite(p) | ~np.isfinite(errbnd)
+                       | (np.asarray(errbnd) > AbsTol + RelTol * np.abs(p)))
+                if np.any(bad):
+                    raise ValueError("Ruben series truncation error exceeds tolerance.")
+            except Exception:
+                p, _ = gx2cdf_davies(x, w, k, lambda_, m, s, side=side, AbsTol=AbsTol, RelTol=RelTol)
     else:
         p, _ = gx2cdf_davies(x, w, k, lambda_, m, s, side=side, AbsTol=AbsTol, RelTol=RelTol)
 
