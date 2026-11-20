@@ -12,12 +12,14 @@ gx2rnd: Generates random numbers from the generalized chi-squared distribution.
 gx2stat: Returns the mean and variance.
 """
 
+import math
+
 import numpy as np
 from scipy.stats import ncx2, chi2, norm
 from scipy.integrate import quad
 from scipy.fft import fft, ifft, ifftshift
 from scipy.linalg import sqrtm
-from scipy.special import logsumexp
+from scipy.special import logsumexp, gammainc
 from scipy.optimize import root
 from typing import Tuple, Union
 
@@ -575,31 +577,124 @@ def gx2cdf_ruben(x: Union[float, np.ndarray], w: np.ndarray, k: np.ndarray, lamb
 RUBEN_N = 5000
 
 
-def _ruben_expected_terms(w: np.ndarray, AbsTol: float = 1e-10) -> float:
+def _ruben_leftover_cap(w: np.ndarray, k: np.ndarray, lambda_: np.ndarray,
+                        N: int = RUBEN_N) -> float:
     """
-    Expected number of terms gx2cdf_ruben needs before its truncation bound
-    drops below the requested absolute tolerance (the masstol the loop stops
-    at).
+    Leftover series mass sum_{j>=N} a_j predicted from w, k and lambda_ alone
+    -- the quantity Ruben's truncation bound is made of, so it is what decides
+    whether a run capped at N terms can still meet the requested tolerance.
 
-    The leftover series mass decays geometrically with ratio
-    rho = 1 - 0.90625 * w_min / w_max, so n* = ln(1/AbsTol) / -ln(rho).
-    Measured against the coefficient recurrence: for lambda = 0 the exit lands
-    within about 10-20% of n* up to 200:1, while non-centrality and the
-    longest spans need up to ~2x more terms because the mass first builds up
-    from a small a[0]. The guess only has to place n* relative to RUBEN_N:
-    whenever it lands on the wrong side, gx2cdf still accepts or rejects the
-    value on its errbnd, so a misestimate costs time, never accuracy.
+    The a_j are the Taylor coefficients of
+        a0 * prod_i (1 - q_i s)^(-k_i/2),   q_i = 1 - beta/w_i,
+    (beta = 0.90625 * w_min), so the series decays geometrically at
+    rho = max_i q_i = 1 - beta/w_max with the algebraic factor n^(alpha-1),
+    alpha = half the degrees of freedom sitting at the weights equal to w_max:
+
+        leftover(N) ~ C * N^(alpha-1) * rho**N / (-ln rho),
+        C = a0 * prod_{i not at w_max} (1 - q_i/rho)^(-k_i/2) / Gamma(alpha).
+
+    Measured against the exact coefficient recurrence this is within 5% for
+    lambda = 0 (worst case 4.8% over spans 10:1 - 310:1, four weight shapes).
+    Non-centrality enters only through a0 (its exp(-sum lambda / 2) factor):
+    the mass then builds up more slowly and the true leftover can be orders of
+    magnitude larger, so for lambda > 0 this estimate is optimistic. That costs
+    time, not accuracy -- gx2cdf still keeps or rejects the value on the errbnd
+    it computes, so an optimistic guess can only waste one capped run.
+
+    Evaluated in log space: underflow gives 0.0 ("will be accepted") and
+    overflow gives inf ("would be rejected"), both safe answers; an a0 below
+    the underflow limit returns inf because gx2cdf_ruben rejects such inputs
+    before the series runs at all.
     """
-    w = np.abs(np.atleast_1d(np.asarray(w, dtype=float)))
-    rho = 1.0 - 0.90625 * np.min(w) / np.max(w)
-    if rho >= 1.0 or not AbsTol > 0:  # zero weight or unsatisfiable tolerance
-        return np.inf
-    return -np.log(AbsTol) / -np.log(rho)
+    w = [abs(v) for v in np.atleast_1d(w).tolist()]
+    k = [float(v) for v in np.atleast_1d(k).tolist()]
+    lam = [float(v) for v in np.atleast_1d(lambda_).tolist()]
+    w_max = max(w)
+    beta = 0.90625 * min(w)
+    rho = 1.0 - beta / w_max
+    if rho >= 1.0:  # zero or equal weights: the series stops immediately
+        return 0.0
+    M = sum(k)
+    # ln a0 kept in log space: a0 itself underflows to 0 for wide spans and
+    # large non-centrality, and this runs on every gx2cdf call, so it is plain
+    # scalar math with no numpy temporaries
+    log_a0 = 0.5 * (-sum(lam) + M * math.log(beta)
+                    - sum(kv * math.log(wv) for kv, wv in zip(k, w)))
+    if log_a0 < math.log(np.finfo(float).tiny):
+        return math.inf  # gx2cdf_ruben rejects such inputs before the series runs
+    alpha = 0.5 * sum(kv for kv, wv in zip(k, w) if wv == w_max)
+    log_c = (log_a0
+             - 0.5 * sum(kv * math.log1p(-(1.0 - beta / wv) / rho)
+                         for kv, wv in zip(k, w) if wv != w_max)
+             - math.lgamma(alpha))
+    arg = (log_c + (alpha - 1.0) * math.log(N)
+           - math.log(-math.log(rho)) + N * math.log(rho))
+    try:
+        return math.exp(arg)  # underflows to 0.0 on its own: "will be accepted"
+    except OverflowError:
+        # only nearly tied top weights reach this; inf reads as "would be
+        # rejected", the safe answer
+        return math.inf
+
+
+def _ruben_worth_trying(x, w: np.ndarray, k: np.ndarray, lambda_: np.ndarray,
+                        m: float, AbsTol: float = 1e-10,
+                        N: int = RUBEN_N) -> bool:
+    """
+    Predict before running anything whether a Ruben call capped at N terms
+    would return a value gx2cdf keeps.
+
+    gx2cdf keeps a Ruben result when its truncation bound
+        errbnd = leftover * chi2.cdf((x - m)/beta, M + 2*n_terms)
+    fits AbsTol + RelTol*|p|. Both factors only shrink as n_terms grows, so
+    the bound at its smallest -- at the cap -- is what a capped run ends with,
+    and the run is worth doing exactly when
+
+        leftover(N) * chi2.cdf((x - m)/beta, M + 2*N) <= AbsTol.
+
+    The tolerance side of that test is conservative -- AbsTol alone, since
+    RelTol*|p| can only add room -- while the leftover side is an estimate
+    (see _ruben_leftover_cap for how close it lands). A wrong "yes" costs one
+    capped run that gx2cdf then rejects on its errbnd; a wrong "no" costs one
+    Davies call where Ruben would have been kept. Neither can change a
+    returned value: acceptance is always decided by the errbnd.
+
+    Both factors are closed form -- _ruben_leftover_cap plus the regularized
+    incomplete gamma that chi2.cdf itself evaluates, taken through the ufunc
+    because the scipy.stats wrapper costs ~300 us and this runs on every
+    gx2cdf call -- so the estimate stays near 100 us instead of the capped run
+    it replaces.
+    The previous rule compared the same bound with both factors dropped
+    (leftover modelled as rho**N, chi2 factor treated as 1), which routed the
+    wide spans whose bound only passes through a small chi2 factor to Davies
+    even though a capped Ruben run would have been accepted.
+    """
+    w = np.atleast_1d(np.asarray(w, dtype=float))
+    if np.all(w < 0):
+        # gx2cdf_ruben flips the signs first; evaluate the bound in its frame
+        x, m, w = -x, -m, -w
+    leftover = _ruben_leftover_cap(w, k, lambda_, N)
+    if leftover == 0.0:
+        return True  # predicted mass is nil, so is the bound, for any x
+    if not math.isfinite(leftover):
+        # a0 underflow (gx2cdf_ruben would raise) or an overflowing estimate:
+        # only Davies can answer
+        return False
+    beta = 0.90625 * float(np.min(w))
+    M = float(np.sum(k))
+    a = 0.5 * (M + 2.0 * N)
+    # chi2.cdf(t, M + 2N) == gammainc((M+2N)/2, t/2); t <= 0 is a bound of 0
+    if np.ndim(x) == 0:
+        t = (float(x) - m) / beta
+        return bool(gammainc(a, 0.5 * t if t > 0.0 else 0.0) <= AbsTol / leftover)
+    t = (np.asarray(x, dtype=float) - m) / beta
+    F = gammainc(a, 0.5 * np.maximum(t, 0.0))
+    return bool(np.all(F <= AbsTol / leftover))
 
 
 def gx2cdf(x: Union[float, np.ndarray], w: np.ndarray, k: np.ndarray, lambda_: np.ndarray, m: float, s: float, side: str = 'lower', AbsTol: float = 1e-10, RelTol: float = 1e-6) -> np.ndarray:
     """
-    Returns the cdf of a generalized chi-squared (a weighted sum of non-central chi-squares and a normal), using Ruben's [1962] method, Davies' [1973] method, or the native ncx2cdf, depending on the input. When Ruben's series is not expected to converge within its term cap, Davies' method is chosen directly; when it has run but has not converged to the requested tolerance, Davies' method is used instead unless the truncation bound still fits the tolerance.
+    Returns the cdf of a generalized chi-squared (a weighted sum of non-central chi-squares and a normal), using Ruben's [1962] method, Davies' [1973] method, or the native ncx2cdf, depending on the input. When Ruben's series is predicted not to meet the requested tolerance even at its term cap, Davies' method is chosen directly; when it has run but has not converged to the requested tolerance, Davies' method is used instead unless the truncation bound still fits the tolerance.
 
     Required inputs:
     x         points at which to evaluate the CDF
@@ -627,10 +722,12 @@ def gx2cdf(x: Union[float, np.ndarray], w: np.ndarray, k: np.ndarray, lambda_: n
         else:
             p = ncx2.sf((x - m) / np.unique(w), sum(k), sum(lambda_))  # survival function (1 - cdf) for 'upper'
     elif s == 0 and (all(w > 0) or all(w < 0)):
-        if _ruben_expected_terms(w, AbsTol) > RUBEN_N:
-            # The series is expected to need more than RUBEN_N terms, so it
-            # cannot converge before the cap and would only burn its term
-            # budget before falling back anyway: take Davies' method directly.
+        if not _ruben_worth_trying(x, w, k, lambda_, m, AbsTol=AbsTol):
+            # Ruben's truncation bound at the cap is predicted to exceed the
+            # tolerance here, so even a full capped run would be rejected: take
+            # Davies' method directly instead of burning the term budget on a
+            # value gx2cdf would throw away. The prediction only picks the
+            # fast path -- acceptance is still decided by the errbnd below.
             p, _ = gx2cdf_davies(x, w, k, lambda_, m, s, side=side, AbsTol=AbsTol, RelTol=RelTol)
         else:
             try:
