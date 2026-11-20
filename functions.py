@@ -453,14 +453,15 @@ def gx2cdf_ruben(x: Union[float, np.ndarray], w: np.ndarray, k: np.ndarray, lamb
 
     Optional positional input:
     N         cap on the no. of terms in the approximation. The series stops
-              early once its truncation bound is below 1e-14, or below
+              early once its truncation bound is below AbsTol, or below
               AbsTol + RelTol * |p| so that the value already meets the
               requested tolerance; if it has not converged within N terms
               (small w_min/w_max), errbnd stays large and the caller should
               use another method. Default = 1000.
-    AbsTol    absolute tolerance used for that early stop; pass the caller's
-              own value so the stop matches its acceptance test.
-    RelTol    relative tolerance used for the same early stop.
+    AbsTol    absolute tolerance for the output; also the masstol the series
+              stops at, so pass the caller's own value and the stop matches
+              its acceptance test (errbnd is then < AbsTol on return).
+    RelTol    relative tolerance used for the periodic early stop.
 
     Outputs:
     p         computed cdf
@@ -497,7 +498,14 @@ def gx2cdf_ruben(x: Union[float, np.ndarray], w: np.ndarray, k: np.ndarray, lamb
     if a[0] < np.finfo(float).tiny:
         raise ValueError('Underflow error: some series coefficients are smaller than machine precision.')
 
-    masstol = 1e-14
+    # Stop the series once the leftover mass is below the requested absolute
+    # tolerance. The truncation bound is leftover * chi2.cdf(...) <= leftover,
+    # and the caller accepts on AbsTol + RelTol * |p| >= AbsTol, so leftover
+    # < AbsTol already guarantees the value passes that test: the loop need
+    # not run on to a fixed 1e-14 that the caller never asked for. The
+    # periodic check below applies the full AbsTol + RelTol * |p| test, which
+    # can stop even earlier when the chi-squared factor or |p| leave room.
+    masstol = AbsTol
     n_terms = N
     cumsum = a[0]
     gflip = g[::-1]  # flip(g[:j]) == gflip[-j:]: no per-term copy of g
@@ -538,12 +546,18 @@ def gx2cdf_ruben(x: Union[float, np.ndarray], w: np.ndarray, k: np.ndarray, lamb
                 break
     a = a[:n_terms]
 
-    # compute the central chi-squared integrals
-    xg, mg = np.meshgrid((x - m) / beta, M + 2 * np.arange(n_terms))
-    F = chi2.cdf(xg, mg)
-
-    # compute the integral
-    p = np.dot(a, F)
+    # compute the integral from the central chi-squared integrals, reusing the
+    # terms the periodic stop already evaluated: p_part holds exactly
+    # sum_{i<=f_done} a[i] * chi2.cdf((x-m)/beta, M + 2i), so only the
+    # remaining terms need their integrals (none, when that stop ended the
+    # loop) instead of evaluating all of them a second time.
+    if p_part is not None and f_done == n_terms - 1:
+        p = p_part
+    else:
+        lo = 0 if p_part is None else f_done + 1
+        xg, mg = np.meshgrid((x - m) / beta, M + 2 * np.arange(lo, n_terms))
+        tail = np.dot(a[lo:], chi2.cdf(xg, mg))
+        p = tail if p_part is None else p_part + tail
 
     # flip if necessary
     if (lambda_pos and side.lower() == 'upper') or (not lambda_pos and side.lower() == 'lower'):
@@ -561,13 +575,14 @@ def gx2cdf_ruben(x: Union[float, np.ndarray], w: np.ndarray, k: np.ndarray, lamb
 RUBEN_N = 5000
 
 
-def _ruben_expected_terms(w: np.ndarray) -> float:
+def _ruben_expected_terms(w: np.ndarray, AbsTol: float = 1e-10) -> float:
     """
     Expected number of terms gx2cdf_ruben needs before its truncation bound
-    drops below its masstol of 1e-14.
+    drops below the requested absolute tolerance (the masstol the loop stops
+    at).
 
     The leftover series mass decays geometrically with ratio
-    rho = 1 - 0.90625 * w_min / w_max, so n* = ln(1e14) / -ln(rho).
+    rho = 1 - 0.90625 * w_min / w_max, so n* = ln(1/AbsTol) / -ln(rho).
     Measured against the coefficient recurrence: for lambda = 0 the exit lands
     within about 10-20% of n* up to 200:1, while non-centrality and the
     longest spans need up to ~2x more terms because the mass first builds up
@@ -577,9 +592,9 @@ def _ruben_expected_terms(w: np.ndarray) -> float:
     """
     w = np.abs(np.atleast_1d(np.asarray(w, dtype=float)))
     rho = 1.0 - 0.90625 * np.min(w) / np.max(w)
-    if rho >= 1.0:  # a zero weight: the series cannot converge at all
+    if rho >= 1.0 or not AbsTol > 0:  # zero weight or unsatisfiable tolerance
         return np.inf
-    return np.log(1e14) / -np.log(rho)
+    return -np.log(AbsTol) / -np.log(rho)
 
 
 def gx2cdf(x: Union[float, np.ndarray], w: np.ndarray, k: np.ndarray, lambda_: np.ndarray, m: float, s: float, side: str = 'lower', AbsTol: float = 1e-10, RelTol: float = 1e-6) -> np.ndarray:
@@ -612,7 +627,7 @@ def gx2cdf(x: Union[float, np.ndarray], w: np.ndarray, k: np.ndarray, lambda_: n
         else:
             p = ncx2.sf((x - m) / np.unique(w), sum(k), sum(lambda_))  # survival function (1 - cdf) for 'upper'
     elif s == 0 and (all(w > 0) or all(w < 0)):
-        if _ruben_expected_terms(w) > RUBEN_N:
+        if _ruben_expected_terms(w, AbsTol) > RUBEN_N:
             # The series is expected to need more than RUBEN_N terms, so it
             # cannot converge before the cap and would only burn its term
             # budget before falling back anyway: take Davies' method directly.
